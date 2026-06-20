@@ -1,0 +1,111 @@
+name: 🎮 MC 服务器自动监控
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 每天12点运行
+  workflow_dispatch:
+    inputs:
+      enable_recording:
+        description: '是否开启录屏（true=录屏 / false=不录屏）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  watchdog:
+    name: 检查状态 / 自动启动 / 自动续期
+    runs-on: ubuntu-latest
+    timeout-minutes: 15       # 原来 10min，录屏合成需要多一点时间
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 SeleniumBase 及依赖
+        run: |
+          pip install seleniumbase
+          python -c "import seleniumbase; print('SeleniumBase', seleniumbase.__version__)"
+
+      - name: 安装系统依赖（Chrome + ffmpeg）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libglib2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
+            libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+            libxss1 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libgbm1 \
+            fonts-liberation xvfb \
+            ffmpeg                  # 🆕 录屏合成用
+          ffmpeg -version | head -1
+
+      - name: 启动虚拟显示（Xvfb）
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+          echo "Xvfb 已启动"
+
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
+          unzip -q xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "=== 直连 IP ==="
+          curl -s --max-time 5 ifconfig.me && echo
+          echo "=== 代理 IP（应为住宅IP）==="
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me && echo
+
+      - name: 运行监控脚本
+        env:
+          WITCHLY_DISCORD_TOKEN: ${{ secrets.WITCHLY_DISCORD_TOKEN }}
+          WITCHLY_SERVER_ID:     ${{ secrets.WITCHLY_SERVER_ID }}
+          TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
+          WX_APP_TOKEN:          ${{ secrets.WX_APP_TOKEN }}
+          WX_UID:                ${{ secrets.WX_UID }}
+          RENEW_THRESHOLD_DAYS:  "1"
+          DISPLAY:               ":99"
+          ENABLE_RECORDING:      ${{ github.event.inputs.enable_recording || 'false' }}
+        run: python watchdog.py
+
+      - name: 上传截图（调试，保留 3 天）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: |
+            screenshots/
+            !screenshots/rec/
+          retention-days: 3
+
+      - name: 上传录屏（保留 3 天）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ github.run_number }}
+          path: recordings/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: 清理旧运行记录（只保留最新 1 条）
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 1
